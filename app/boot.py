@@ -71,13 +71,15 @@ def boot():
         if created:
             logger.info("Created default theme")
 
-        if Setting.objects.all().count() == 0:
-            default_logo = os.path.join('app', 'static', 'app', 'img', 'logo512.png')
+            if settings.DEFAULT_THEME_CSS:
+                default_theme.css = settings.DEFAULT_THEME_CSS
+                default_theme.save()
 
+        if Setting.objects.all().count() == 0:
             s = Setting.objects.create(
-                    app_name='WebODM',
+                    app_name=settings.APP_NAME,
                     theme=default_theme)
-            s.app_logo.save(os.path.basename(default_logo), File(open(default_logo, 'rb')))
+            s.app_logo.save(os.path.basename(settings.APP_DEFAULT_LOGO), File(open(settings.APP_DEFAULT_LOGO, 'rb')))
 
             logger.info("Created settings")
 
@@ -96,6 +98,10 @@ def boot():
 
 def add_default_presets():
     try:
+        Preset.objects.update_or_create(name='Multispectral', system=True,
+                                        defaults={'options': [{'name': 'texturing-skip-global-seam-leveling', 'value': True},
+                                                              {'name': 'texturing-data-term', 'value': 'area'},
+                                                              ]})
         Preset.objects.update_or_create(name='Volume Analysis', system=True,
                                         defaults={'options': [{'name': 'dsm', 'value': True},
                                                               {'name': 'dem-resolution', 'value': '2'},
