@@ -50,6 +50,9 @@ if [ "$1" = "--setup-devenv" ] || [ "$2" = "--setup-devenv" ]; then
     echo Setup pip requirements...
     pip install -r requirements.txt
 
+    echo Build translations...
+    ./translate.sh build safe
+
     echo Setup webpack watch...
     webpack --watch &
 fi
@@ -137,7 +140,7 @@ else
     congrats
 
     nginx -c $(pwd)/nginx/$conf
-    gunicorn webodm.wsgi --bind unix:/tmp/gunicorn.sock --timeout 300000 --max-requests 250 --preload
+    gunicorn webodm.wsgi --bind unix:/tmp/gunicorn.sock --timeout 300000 --max-requests 250 --workers $((2*$(grep -c '^processor' /proc/cpuinfo)+1)) --preload 
 fi
 
 # If this is executed, it means the previous command failed, don't display the congratulations message
