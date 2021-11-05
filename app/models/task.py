@@ -12,14 +12,14 @@ import piexif
 import re
 
 import zipfile
-
+from shutil import copyfile
 import requests
 from PIL import Image
 from django.contrib.gis.gdal import GDALRaster
 from django.contrib.gis.gdal import OGRGeometry
 from django.contrib.gis.geos import GEOSGeometry
 from django.contrib.postgres import fields
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ValidationError, SuspiciousFileOperation
 from django.db import models
 from django.db import transaction
 from django.db import connection
@@ -31,6 +31,7 @@ from django.contrib.gis.db.models.fields import GeometryField
 
 from app.cogeo import assure_cogeo
 from app.testwatch import testWatch
+from app.api.common import path_traversal_check
 from nodeodm import status_codes
 from nodeodm.models import ProcessingNode
 from pyodm.exceptions import NodeResponseError, NodeConnectionError, NodeServerError, OdmError
@@ -170,6 +171,7 @@ class Task(models.Model):
             'orthophoto.tif': os.path.join('odm_orthophoto', 'odm_orthophoto.tif'),
             'orthophoto.png': os.path.join('odm_orthophoto', 'odm_orthophoto.png'),
             'orthophoto.mbtiles': os.path.join('odm_orthophoto', 'odm_orthophoto.mbtiles'),
+            'orthophoto.kmz': os.path.join('odm_orthophoto', 'odm_orthophoto.kmz'),
             'georeferenced_model.las': os.path.join('odm_georeferencing', 'odm_georeferenced_model.las'),
             'georeferenced_model.laz': os.path.join('odm_georeferencing', 'odm_georeferenced_model.laz'),
             'georeferenced_model.ply': os.path.join('odm_georeferencing', 'odm_georeferenced_model.ply'),
@@ -195,6 +197,7 @@ class Task(models.Model):
             'cameras.json': 'cameras.json',
             'shots.geojson': os.path.join('odm_report', 'shots.geojson'),
             'report.pdf': os.path.join('odm_report', 'report.pdf'),
+            'ground_control_points.geojson': os.path.join('odm_georeferencing', 'ground_control_points.geojson'),
     }
 
     STATUS_CODES = (
@@ -255,6 +258,7 @@ class Task(models.Model):
     import_url = models.TextField(null=False, default="", blank=True, help_text=_("URL this task is imported from (only for imported tasks)"), verbose_name=_("Import URL"))
     images_count = models.IntegerField(null=False, blank=True, default=0, help_text=_("Number of images associated with this task"), verbose_name=_("Images Count"))
     partial = models.BooleanField(default=False, help_text=_("A flag indicating whether this task is currently waiting for information or files to be uploaded before being considered for processing."), verbose_name=_("Partial"))
+    potree_scene = fields.JSONField(default=dict, blank=True, help_text=_("Serialized potree scene information used to save/load measurements and camera view angle"), verbose_name=_("Potree Scene"))
 
     class Meta:
         verbose_name = _("Task")
@@ -309,8 +313,26 @@ class Task(models.Model):
             self.move_assets(self.__original_project_id, self.project.id)
             self.__original_project_id = self.project.id
 
-        # Autovalidate on save
-        self.full_clean()
+        # Manually validate the fields we want,
+        # since Django's clean_fields() method obliterates 
+        # our foreign keys without explanation :/
+        errors = {}
+        for f in self._meta.fields:
+            if f.attname in ["options"]:
+                raw_value = getattr(self, f.attname)
+                if f.blank and raw_value in f.empty_values:
+                    continue
+
+                try:
+                    setattr(self, f.attname, f.clean(raw_value, self))
+                except ValidationError as e:
+                    errors[f.name] = e.error_list
+
+        if errors:
+            raise ValidationError(errors)
+
+        self.clean()
+        self.validate_unique()
 
         super(Task, self).save(*args, **kwargs)
 
@@ -346,6 +368,73 @@ class Task(models.Model):
 
         return False
 
+    def get_statistics(self):
+        """
+        Parse ODM's stats.json if available
+        """
+        stats_json = self.assets_path("odm_report", "stats.json")
+        if os.path.exists(stats_json):
+            try:
+                with open(stats_json) as f:
+                    j = json.loads(f.read())
+            except Exception as e:
+                logger.warning("Malformed JSON {}: {}".format(stats_json, str(e)))
+                return {}
+
+            points = None
+            if j.get('point_cloud_statistics', {}).get('dense', False):
+                points = j.get('point_cloud_statistics', {}).get('stats', {}).get('statistic', [{}])[0].get('count')
+            else:
+                points = j.get('reconstruction_statistics', {}).get('reconstructed_points_count')
+                        
+            return {
+                'pointcloud':{
+                    'points': points,
+                },
+                'gsd': j.get('odm_processing_statistics', {}).get('average_gsd'),
+                'area': j.get('processing_statistics', {}).get('area')
+            }
+        else:
+            return {}
+
+    def duplicate(self, set_new_name=True):
+        try:
+            with transaction.atomic():
+                task = Task.objects.get(pk=self.pk)
+                task.pk = None
+                if set_new_name:
+                    task.name = gettext('Copy of %(task)s') % {'task': self.name}
+                task.created_at = timezone.now()
+                task.save()
+                task.refresh_from_db()
+
+                logger.info("Duplicating {} to {}".format(self, task))
+
+                for img in self.imageupload_set.all():
+                    img.pk = None
+                    img.task = task
+
+                    prev_name = img.image.name
+                    img.image.name = assets_directory_path(task.id, task.project.id,
+                                                            os.path.basename(img.image.name))
+                    
+                    img.save()
+
+                if os.path.isdir(self.task_path()):
+                    try:
+                        # Try to use hard links first
+                        shutil.copytree(self.task_path(), task.task_path(), copy_function=os.link)
+                    except Exception as e:
+                        logger.warning("Cannot duplicate task using hard links, will use normal copy instead: {}".format(str(e)))
+                        shutil.copytree(self.task_path(), task.task_path())
+                else:
+                    logger.warning("Task {} doesn't have folder, will skip copying".format(self))
+            return task
+        except Exception as e:
+            logger.warning("Cannot duplicate task: {}".format(str(e)))
+        
+        return False
+        
     def get_asset_download_path(self, asset):
         """
         Get the path to an asset download
@@ -374,35 +463,48 @@ class Task(models.Model):
         self.save()
 
         zip_path = self.assets_path("all.zip")
-
+        # Import assets file from mounted system volume (media-dir)/imports by relative path.
+        # Import file from relative path.
         if self.import_url and not os.path.exists(zip_path):
-            try:
-                # TODO: this is potentially vulnerable to a zip bomb attack
-                #       mitigated by the fact that a valid account is needed to
-                #       import tasks
-                logger.info("Importing task assets from {} for {}".format(self.import_url, self))
-                download_stream = requests.get(self.import_url, stream=True, timeout=10)
-                content_length = download_stream.headers.get('content-length')
-                total_length = int(content_length) if content_length is not None else None
-                downloaded = 0
-                last_update = 0
+            if self.import_url.startswith("file://"):
+                imports_folder_path = os.path.join(settings.MEDIA_ROOT, "imports")
+                unsafe_path_to_import_file = os.path.join(settings.MEDIA_ROOT, "imports", self.import_url.replace("file://", ""))
+                # check is file placed in shared media folder in /imports directory without traversing
+                try:
+                    checked_path_to_file = path_traversal_check(unsafe_path_to_import_file, imports_folder_path)
+                    if os.path.isfile(checked_path_to_file):
+                        copyfile(checked_path_to_file, zip_path)
+                except SuspiciousFileOperation as e:
+                    logger.error("Error due importing assets from {} for {} in cause of path checking error".format(self.import_url, self))
+                    raise NodeServerError(e)
+            else:
+                try:
+                    # TODO: this is potentially vulnerable to a zip bomb attack
+                    #       mitigated by the fact that a valid account is needed to
+                    #       import tasks
+                    logger.info("Importing task assets from {} for {}".format(self.import_url, self))
+                    download_stream = requests.get(self.import_url, stream=True, timeout=10)
+                    content_length = download_stream.headers.get('content-length')
+                    total_length = int(content_length) if content_length is not None else None
+                    downloaded = 0
+                    last_update = 0
 
-                with open(zip_path, 'wb') as fd:
-                    for chunk in download_stream.iter_content(4096):
-                        downloaded += len(chunk)
+                    with open(zip_path, 'wb') as fd:
+                        for chunk in download_stream.iter_content(4096):
+                            downloaded += len(chunk)
 
-                        if time.time() - last_update >= 2:
-                            # Update progress
-                            if total_length is not None:
-                                Task.objects.filter(pk=self.id).update(running_progress=(float(downloaded) / total_length) * 0.9)
+                            if time.time() - last_update >= 2:
+                                # Update progress
+                                if total_length is not None:
+                                    Task.objects.filter(pk=self.id).update(running_progress=(float(downloaded) / total_length) * 0.9)
 
-                            self.check_if_canceled()
-                            last_update = time.time()
+                                self.check_if_canceled()
+                                last_update = time.time()
 
-                        fd.write(chunk)
+                            fd.write(chunk)
 
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, ReadTimeoutError) as e:
-                raise NodeServerError(e)
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, ReadTimeoutError) as e:
+                    raise NodeServerError(e)
 
         self.refresh_from_db()
 
@@ -744,6 +846,7 @@ class Task(models.Model):
                 logger.info("Populated extent field with {} for {}".format(raster_path, self))
 
         self.update_available_assets_field()
+        self.potree_scene = {}
         self.running_progress = 1.0
         self.console_output += gettext("Done!") + "\n"
         self.status = status_codes.COMPLETED
@@ -772,6 +875,9 @@ class Task(models.Model):
         camera_shots = ''
         if 'shots.geojson' in self.available_assets: camera_shots = '/api/projects/{}/tasks/{}/download/shots.geojson'.format(self.project.id, self.id)
 
+        ground_control_points = ''
+        if 'ground_control_points.geojson' in self.available_assets: ground_control_points = '/api/projects/{}/tasks/{}/download/ground_control_points.geojson'.format(self.project.id, self.id)
+
         return {
             'tiles': [{'url': self.get_tile_base_url(t), 'type': t} for t in types],
             'meta': {
@@ -779,7 +885,8 @@ class Task(models.Model):
                     'id': str(self.id),
                     'project': self.project.id,
                     'public': self.public,
-                    'camera_shots': camera_shots
+                    'camera_shots': camera_shots,
+                    'ground_control_points': ground_control_points
                 }
             }
         }
