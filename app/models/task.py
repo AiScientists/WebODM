@@ -135,15 +135,15 @@ def resize_image(image_path, resize_to, done=None):
         resized_width = int(width * ratio)
         resized_height = int(height * ratio)
 
-        im = im.resize((resized_width, resized_height), Image.BILINEAR)
+        im = im.resize((resized_width, resized_height), Image.LANCZOS)
         params = {}
         if is_jpeg:
             params['quality'] = 100
 
         if 'exif' in im.info:
             exif_dict = piexif.load(im.info['exif'])
-            exif_dict['Exif'][piexif.ExifIFD.PixelXDimension] = resized_width
-            exif_dict['Exif'][piexif.ExifIFD.PixelYDimension] = resized_height
+            #exif_dict['Exif'][piexif.ExifIFD.PixelXDimension] = resized_width
+            #exif_dict['Exif'][piexif.ExifIFD.PixelYDimension] = resized_height
             im.save(resized_image_path, exif=piexif.dump(exif_dict), **params)
         else:
             im.save(resized_image_path, **params)
@@ -185,6 +185,14 @@ class Task(models.Model):
             'textured_model.zip': {
                 'deferred_path': 'textured_model.zip',
                 'deferred_compress_dir': 'odm_texturing'
+            },
+            '3d_tiles_model.zip': {
+                'deferred_path': '3d_tiles_model.zip',
+                'deferred_compress_dir': os.path.join('3d_tiles', 'model')
+            },
+            '3d_tiles_pointcloud.zip': {
+                'deferred_path': '3d_tiles_pointcloud.zip',
+                'deferred_compress_dir': os.path.join('3d_tiles', 'pointcloud')
             },
             'dtm.tif': os.path.join('odm_dem', 'dtm.tif'),
             'dsm.tif': os.path.join('odm_dem', 'dsm.tif'),
@@ -1074,6 +1082,9 @@ class Task(models.Model):
         :return: path to changed GCP file or None if no GCP file was found/changed
         """
         gcp_path = self.find_all_files_matching(r'.*\.txt$')
+
+        # Skip geo.txt, image_groups.txt files
+        gcp_path = list(filter(lambda p: os.path.basename(p).lower() not in ['geo.txt', 'image_groups.txt'], gcp_path))
         if len(gcp_path) == 0: return None
 
         # Assume we only have a single GCP file per task
